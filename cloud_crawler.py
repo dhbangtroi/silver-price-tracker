@@ -26,7 +26,9 @@ G_FILTER_WORKSHEET_NAME : str, optional
 
 import json
 import os
+import re
 import sys
+import csv
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -50,6 +52,7 @@ except ImportError:
 
 CSV_COLUMNS = ["crawled_at", "metal", "category", "product", "sell_price", "buy_price", "url"]
 FILTER_COLUMNS = ["product", "investment_price", "investment_date"]
+BASE_DIR = Path(__file__).resolve().parent
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh") if ZoneInfo else None
 
 ANCARAT_URL = "https://giabac.ancarat.com"
@@ -444,13 +447,102 @@ def sheet_records(sheet: gspread.Worksheet) -> List[Dict[str, str]]:
     return [{str(key): value for key, value in record.items()} for record in records]
 
 
+def candidate_data_paths(filename: str) -> List[Path]:
+    """Return possible local data file locations.
+
+    Parameters
+    ----------
+    filename : str
+        CSV file name under a ``data`` directory.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Candidate paths for both root-level and ``cloud`` subfolder layouts.
+    """
+    return [
+        Path("data") / filename,
+        BASE_DIR / "data" / filename,
+        BASE_DIR.parent / "data" / filename,
+    ]
+
+
+def read_csv_records(path: Path) -> List[Dict[str, str]]:
+    """Read price history rows from a CSV file.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        CSV path to read.
+
+    Returns
+    -------
+    list of dict
+        CSV records as dictionaries.
+    """
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def load_local_history_records() -> List[Dict[str, str]]:
+    """Load committed local price history CSV files when present.
+
+    Returns
+    -------
+    list of dict
+        Historical rows from ``data/ancarat_prices.csv`` and
+        ``data/doji_prices.csv``. Missing files are skipped.
+    """
+    records: List[Dict[str, str]] = []
+    for filename in ("ancarat_prices.csv", "doji_prices.csv"):
+        seen_paths = set()
+        for path in candidate_data_paths(filename):
+            resolved = path.resolve()
+            if resolved in seen_paths or not path.exists():
+                continue
+            seen_paths.add(resolved)
+            file_records = read_csv_records(path)
+            records.extend(file_records)
+            print(f"Loaded {len(file_records)} local history rows from {path}")
+            break
+
+    return records
+
+
+def combine_history_records(
+    sheet_history: List[Dict[str, str]], local_history: List[Dict[str, str]]
+) -> List[Dict[str, str]]:
+    """Combine local CSV and Google Sheet history rows.
+
+    Parameters
+    ----------
+    sheet_history : list of dict
+        Price records read from Google Sheets.
+    local_history : list of dict
+        Price records read from local CSV files.
+
+    Returns
+    -------
+    list of dict
+        De-duplicated history records. Google Sheet rows are kept when a row
+        exists in both sources.
+    """
+    combined: Dict[Tuple[str, ...], Dict[str, str]] = {}
+    for row in local_history + sheet_history:
+        key = tuple(str(row.get(column, "")).strip() for column in CSV_COLUMNS)
+        combined[key] = row
+
+    return list(combined.values())
+
+
 def parse_number(value: object) -> Optional[float]:
     """Parse a spreadsheet number value.
 
     Parameters
     ----------
     value : object
-        Spreadsheet value such as ``2,909,000`` or ``2909000``.
+        Spreadsheet value such as ``2,909,000``, ``2.909.000``,
+        ``2909000``, or numeric ``2909000.0``.
 
     Returns
     -------
@@ -460,17 +552,82 @@ def parse_number(value: object) -> Optional[float]:
     if value is None:
         return None
 
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
     text = str(value).strip()
     if not text:
         return None
 
-    negative = text.startswith("-")
-    digits = "".join(char for char in text if char.isdigit())
-    if not digits:
+    normalized = re.sub(r"[^\d,.\-]", "", text)
+    if not normalized or normalized in {"-", ",", "."}:
         return None
 
-    number = float(digits)
+    negative = normalized.startswith("-")
+    normalized = normalized.lstrip("-")
+
+    if "," in normalized and "." in normalized:
+        if normalized.rfind(".") > normalized.rfind(","):
+            normalized = normalized.replace(",", "")
+        else:
+            normalized = normalized.replace(".", "").replace(",", ".")
+    elif "," in normalized:
+        parts = normalized.split(",")
+        if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]):
+            normalized = "".join(parts)
+        else:
+            normalized = normalized.replace(",", ".")
+    elif "." in normalized:
+        parts = normalized.split(".")
+        if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]):
+            normalized = "".join(parts)
+
+    try:
+        number = float(normalized)
+    except ValueError:
+        return None
+
     return -number if negative else number
+
+
+def parse_datetime(value: object) -> pd.Timestamp:
+    """Parse a Google Sheet or CSV datetime value.
+
+    Parameters
+    ----------
+    value : object
+        Datetime value from gspread or CSV. Supports ISO-like strings,
+        Vietnamese day-first date strings, and Google Sheets serial date
+        numbers.
+
+    Returns
+    -------
+    pandas.Timestamp
+        Parsed timestamp, or ``NaT`` when parsing fails.
+    """
+    if value is None or value == "":
+        return pd.NaT
+
+    if isinstance(value, datetime):
+        return pd.Timestamp(value)
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Google Sheets serial dates count days from 1899-12-30.
+        if 20_000 <= float(value) <= 80_000:
+            return pd.to_datetime(float(value), unit="D", origin="1899-12-30", errors="coerce")
+
+    text = str(value).strip()
+    if not text:
+        return pd.NaT
+
+    parsed = pd.to_datetime(text, errors="coerce", yearfirst=True)
+    if pd.notna(parsed):
+        return parsed
+
+    return pd.to_datetime(text, errors="coerce", dayfirst=True)
 
 
 def load_filter_records(sheet: gspread.Worksheet) -> List[Dict[str, str]]:
