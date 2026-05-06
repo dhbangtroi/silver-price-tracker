@@ -1,0 +1,23 @@
+name: Silver Price Cloud Sync
+on:
+  schedule:
+    - cron: '0 3,10 * * *' # 10:00 AM and 5:00 PM ICT (adjust for UTC)
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  run-crawler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pandas matplotlib gspread oauth2client
+      - name: Run Crawler
+        env:
+          G_SHEET_JSON: ${{ secrets.G_SHEET_JSON }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python cloud_crawler.py
