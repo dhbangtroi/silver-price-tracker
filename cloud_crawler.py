@@ -525,8 +525,9 @@ def prepare_chart_data(
     Returns
     -------
     pandas.DataFrame
-        Chart-ready rows filtered to selected products. Includes ``gap``,
-        calculated as ``buy_price - investment_price``.
+        Chart-ready rows filtered to selected products. Includes numeric
+        ``sell_price``, ``buy_price``, and ``gap``. Gap is calculated as
+        ``buy_price - investment_price``.
     """
     if not price_records:
         return pd.DataFrame()
@@ -538,7 +539,9 @@ def prepare_chart_data(
 
     prices["product"] = prices["product"].astype(str).str.strip()
     filters["product"] = filters["product"].astype(str).str.strip()
+    filters["_filter_order"] = range(len(filters))
     prices["crawled_at"] = pd.to_datetime(prices["crawled_at"], errors="coerce")
+    prices["sell_price"] = prices["sell_price"].apply(parse_number)
     prices["buy_price"] = prices["buy_price"].apply(parse_number)
     filters["investment_price"] = filters["investment_price"].apply(parse_number)
     filters["investment_date"] = pd.to_datetime(
@@ -549,13 +552,13 @@ def prepare_chart_data(
     filters = filters[filters["product"] != ""].drop_duplicates("product", keep="last")
 
     chart_df = prices.merge(
-        filters[["product", "investment_price", "investment_date"]],
+        filters[["product", "investment_price", "investment_date", "_filter_order"]],
         on="product",
         how="inner",
     )
-    chart_df = chart_df.dropna(subset=["crawled_at", "buy_price", "investment_price"])
+    chart_df = chart_df.dropna(subset=["crawled_at", "sell_price", "buy_price", "investment_price"])
     chart_df["gap"] = chart_df["buy_price"] - chart_df["investment_price"]
-    return chart_df.sort_values(["product", "crawled_at"])
+    return chart_df.sort_values(["_filter_order", "product", "crawled_at"])
 
 
 def start_of_quarter(value: datetime) -> datetime:
@@ -643,7 +646,8 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
     ----------
     df : pandas.DataFrame
         Period-filtered chart data. Must include ``product``, ``crawled_at``,
-        ``buy_price``, ``investment_price``, ``investment_date``, and ``gap``.
+        ``sell_price``, ``buy_price``, ``investment_price``,
+        ``investment_date``, and ``gap``.
     period_title : str
         Human-readable period label for the chart title.
     output_path : pathlib.Path
@@ -672,13 +676,21 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
         sharex=True,
         squeeze=False,
     )
-    fig.suptitle(f"Silver Buy Price Gap - {period_title}", fontsize=18, fontweight="bold", color="#e83e8c")
+    fig.suptitle(f"Silver Price And Investment Gap - {period_title}", fontsize=18, fontweight="bold", color="#e83e8c")
 
     for axis, product in zip(axes.flatten(), products):
         product_df = df[df["product"] == product].sort_values("crawled_at")
         investment_price = product_df["investment_price"].iloc[-1]
         investment_date = product_df["investment_date"].iloc[-1]
 
+        axis.plot(
+            product_df["crawled_at"],
+            product_df["sell_price"],
+            marker="o",
+            color="#f26b2d",
+            linewidth=2,
+            label="sell_price",
+        )
         axis.plot(
             product_df["crawled_at"],
             product_df["buy_price"],
@@ -730,7 +742,7 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
 
         latest = product_df.iloc[-1]
         axis.annotate(
-            f"buy {format_vnd_short(latest['buy_price'])}\ngap {format_vnd_short(latest['gap'])}",
+            f"sell {format_vnd_short(latest['sell_price'])}\nbuy {format_vnd_short(latest['buy_price'])}\ngap {format_vnd_short(latest['gap'])}",
             xy=(latest["crawled_at"], latest["buy_price"]),
             xytext=(8, 10),
             textcoords="offset points",
@@ -764,9 +776,17 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
         )
         gap_axis.axhline(0, color="#999999", linewidth=0.8, alpha=0.6)
         gap_axis.set_ylabel("gap")
+        axis.right_ax = gap_axis
 
     handles, labels = axes.flatten()[0].get_legend_handles_labels()
-    fig.legend(handles[:2], labels[:2], loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.97))
+    gap_handles, gap_labels = axes.flatten()[0].right_ax.get_legend_handles_labels() if hasattr(axes.flatten()[0], "right_ax") else ([], [])
+    fig.legend(
+        handles[:3] + gap_handles[:1],
+        labels[:3] + gap_labels[:1],
+        loc="upper center",
+        ncol=4,
+        bbox_to_anchor=(0.5, 0.97),
+    )
     fig.autofmt_xdate(rotation=25)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(output_path, dpi=150)
@@ -774,22 +794,38 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
     return output_path
 
 
-def generate_period_charts(records: List[Dict[str, str]], filter_records: List[Dict[str, str]]) -> List[Path]:
+def log_period_counts(period_title: str, df: pd.DataFrame) -> None:
+    """Log product point counts for a chart period.
+
+    Parameters
+    ----------
+    period_title : str
+        Human-readable chart period name.
+    df : pandas.DataFrame
+        Period-filtered chart data.
+    """
+    if df.empty:
+        print(f"{period_title}: no matching filtered product rows")
+        return
+
+    counts = df.groupby("product")["crawled_at"].count()
+    formatted_counts = ", ".join(f"{product}={count}" for product, count in counts.items())
+    print(f"{period_title}: chart data points by product: {formatted_counts}")
+
+
+def generate_period_charts(chart_df: pd.DataFrame) -> List[Path]:
     """Generate month, quarter, and year gap charts.
 
     Parameters
     ----------
-    records : list of dict
-        Price history records from the main worksheet.
-    filter_records : list of dict
-        Product filter records with investment prices.
+    chart_df : pandas.DataFrame
+        Chart-ready data from :func:`prepare_chart_data`.
 
     Returns
     -------
     list of pathlib.Path
         Paths to generated PNG chart files.
     """
-    chart_df = prepare_chart_data(records, filter_records)
     if chart_df.empty:
         print(f'No matching products found between "{WORKSHEET_NAME}" and "{FILTER_WORKSHEET_NAME}"')
         return []
@@ -804,6 +840,7 @@ def generate_period_charts(records: List[Dict[str, str]], filter_records: List[D
     chart_paths: List[Path] = []
     for period_name, title, path in chart_specs:
         period_df = filter_period(chart_df, period_name, now)
+        log_period_counts(title, period_df)
         chart_path = generate_gap_chart(period_df, title, path)
         if chart_path:
             chart_paths.append(chart_path)
@@ -811,27 +848,60 @@ def generate_period_charts(records: List[Dict[str, str]], filter_records: List[D
     return chart_paths
 
 
-def build_summary(rows: List[Dict[str, str]]) -> str:
-    """Build the Telegram text summary for the crawl.
+def format_vnd(value: object) -> str:
+    """Format a numeric VND value with thousands separators.
 
     Parameters
     ----------
-    rows : list of dict
-        Newly crawled price rows.
+    value : object
+        Numeric value or parseable spreadsheet value.
 
     Returns
     -------
     str
-        Telegram-ready summary text.
+        Formatted VND value, or ``N/A`` when the value cannot be parsed.
     """
-    lines = [f"Silver price crawl completed at {format_dt(local_now())}", ""]
-    for row in rows[:12]:
-        sell = f"{int(row['sell_price']):,}" if row.get("sell_price") else "N/A"
-        buy = f"{int(row['buy_price']):,}" if row.get("buy_price") else "N/A"
-        lines.append(f"{row['product']}: sell {sell} VND | buy {buy} VND")
+    number = parse_number(value)
+    if number is None:
+        return "N/A"
+    return f"{int(number):,} VND"
 
-    if len(rows) > 12:
-        lines.append(f"...and {len(rows) - 12} more rows")
+
+def build_summary(chart_df: pd.DataFrame) -> str:
+    """Build the filtered Telegram text summary.
+
+    Parameters
+    ----------
+    chart_df : pandas.DataFrame
+        Chart-ready data filtered to products listed in the ``filter`` sheet.
+
+    Returns
+    -------
+    str
+        Telegram-ready summary text containing sell price, buy price,
+        investment price, and ``buy_price - investment_price`` gap for each
+        tracked product.
+    """
+    lines = [f"Filtered silver price gap at {format_dt(local_now())}", ""]
+    if chart_df.empty:
+        lines.append(f'No products from "{FILTER_WORKSHEET_NAME}" matched price history.')
+        return "\n".join(lines)
+
+    latest_rows = chart_df.groupby("product", sort=False, group_keys=False).tail(1)
+    for _, row in latest_rows.iterrows():
+        gap = row["gap"]
+        gap_marker = "above" if gap >= 0 else "below"
+        crawled_at = row["crawled_at"].strftime("%Y-%m-%d %H:%M")
+        lines.append(str(row["product"]))
+        lines.append(f"Sell: {format_vnd(row['sell_price'])}")
+        lines.append(f"Buy: {format_vnd(row['buy_price'])}")
+        lines.append(f"Investment: {format_vnd(row['investment_price'])}")
+        lines.append(f"Gap: {format_vnd(gap)} ({gap_marker} investment)")
+        lines.append(f"Latest: {crawled_at}")
+        lines.append("")
+
+    if lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
@@ -919,9 +989,10 @@ def run_cloud_sync() -> None:
     append_rows_to_sheet(price_sheet, rows)
     records = sheet_records(price_sheet)
     filter_records = load_filter_records(filter_sheet)
-    chart_paths = generate_period_charts(records, filter_records)
+    chart_df = prepare_chart_data(records, filter_records)
+    chart_paths = generate_period_charts(chart_df)
 
-    summary = build_summary(rows)
+    summary = build_summary(chart_df)
     send_telegram_message(summary)
     for chart_path in chart_paths:
         send_telegram_photo(chart_path, chart_path.stem.replace("_", " ").title())
