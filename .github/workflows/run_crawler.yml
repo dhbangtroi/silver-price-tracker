@@ -1,23 +1,38 @@
 name: Silver Price Cloud Sync
+
 on:
   schedule:
-    - cron: '0 3,10 * * *' # 10:00 AM and 5:00 PM ICT (adjust for UTC)
-  workflow_dispatch: # Manual trigger
+    # 03:00 UTC = 10:00 ICT, 10:00 UTC = 17:00 ICT
+    - cron: "0 3,10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run-crawler:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
+      - name: Checkout repository without external actions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+
+      - name: Show Python version
+        run: python3 --version
+
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 pandas matplotlib gspread oauth2client
-      - name: Run Crawler
+        run: python3 -m pip install requests beautifulsoup4 pandas matplotlib gspread oauth2client
+
+      - name: Run crawler
         env:
           G_SHEET_JSON: ${{ secrets.G_SHEET_JSON }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python cloud_crawler.py
+          G_SHEET_NAME: Silver_Prices
+          G_WORKSHEET_NAME: Sheet1
+        run: python3 cloud_crawler.py
