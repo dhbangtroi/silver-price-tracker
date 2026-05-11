@@ -735,6 +735,17 @@ def start_of_quarter(value: datetime) -> datetime:
     return value.replace(month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+def get_period_start(period_name: str, now: datetime) -> datetime:
+    """Return the start timestamp for a named chart period."""
+    if period_name == "month":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period_name == "quarter":
+        return start_of_quarter(now)
+    if period_name == "year":
+        return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    raise ValueError(f"Unknown chart period: {period_name}")
+
+
 def filter_period(df: pd.DataFrame, period_name: str, now: datetime) -> pd.DataFrame:
     """Filter chart data to a named reporting period.
 
@@ -761,14 +772,7 @@ def filter_period(df: pd.DataFrame, period_name: str, now: datetime) -> pd.DataF
     if df.empty:
         return df
 
-    if period_name == "month":
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    elif period_name == "quarter":
-        start = start_of_quarter(now)
-    elif period_name == "year":
-        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        raise ValueError(f"Unknown chart period: {period_name}")
+    start = get_period_start(period_name, now)
 
     period_df = df[df["crawled_at"] >= pd.Timestamp(start)]
     return period_df.copy()
@@ -796,7 +800,12 @@ def format_vnd_short(value: float) -> str:
     return f"{sign}{abs_value:.0f}"
 
 
-def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -> Optional[Path]:
+def generate_gap_chart(
+    df: pd.DataFrame,
+    period_title: str,
+    output_path: Path,
+    x_axis_start: Optional[datetime] = None,
+) -> Optional[Path]:
     """Generate a buy-price investment gap chart.
 
     Parameters
@@ -809,6 +818,8 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
         Human-readable period label for the chart title.
     output_path : pathlib.Path
         PNG output path.
+    x_axis_start : datetime, optional
+        Lower bound for each subplot x-axis.
 
     Returns
     -------
@@ -830,7 +841,7 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
         len(products),
         1,
         figsize=(14, fig_height),
-        sharex=True,
+        sharex=False,
         squeeze=False,
     )
     fig.suptitle(f"Silver Price And Investment Gap - {period_title}", fontsize=18, fontweight="bold", color="#e83e8c")
@@ -920,6 +931,8 @@ def generate_gap_chart(df: pd.DataFrame, period_title: str, output_path: Path) -
         axis.set_title(product, loc="left", fontsize=11)
         axis.set_ylabel("VND")
         axis.grid(True, linestyle="--", alpha=0.3)
+        if x_axis_start is not None:
+            axis.set_xlim(left=pd.Timestamp(x_axis_start))
 
         gap_axis = axis.twinx()
         gap_axis.plot(
@@ -996,9 +1009,10 @@ def generate_period_charts(chart_df: pd.DataFrame) -> List[Path]:
 
     chart_paths: List[Path] = []
     for period_name, title, path in chart_specs:
+        period_start = get_period_start(period_name, now)
         period_df = filter_period(chart_df, period_name, now)
         log_period_counts(title, period_df)
-        chart_path = generate_gap_chart(period_df, title, path)
+        chart_path = generate_gap_chart(period_df, title, path, period_start)
         if chart_path:
             chart_paths.append(chart_path)
 
